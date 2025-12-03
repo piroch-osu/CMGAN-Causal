@@ -8,6 +8,7 @@ import torchaudio
 import soundfile as sf
 import argparse
 import time
+from tqdm import tqdm
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("Using device:", device)
@@ -22,6 +23,10 @@ def enhance_one_track(
 
     name = os.path.split(audio_path)[-1]
     noisy, sr = torchaudio.load(audio_path) # Load audio with shape -> (1, samples)
+    if sr != 16000:
+        resampler = torchaudio.transforms.Resample(orig_freq=sr, new_freq=16000)
+        noisy = resampler(noisy)
+        sr = 16000
     assert sr == 16000
     noisy = noisy.to(device) # Move to GPU
 
@@ -29,6 +34,7 @@ def enhance_one_track(
     c = torch.sqrt(noisy.size(-1) / torch.sum((noisy**2.0), dim=-1))
     noisy = torch.transpose(noisy, 0, 1)
     noisy = torch.transpose(noisy * c, 0, 1)
+
 
     length = noisy.size(-1)
     # Pad audio to be a multiple of 100 samples
@@ -64,7 +70,7 @@ def enhance_one_track(
     )
     est_audio = est_audio / c # Undo earlier normalization
     est_audio = torch.flatten(est_audio)[:length].cpu().numpy() # Remove padding
-    assert len(est_audio) == length
+    # assert len(est_audio) == length
     if save_tracks:
         saved_path = os.path.join(saved_dir, name)
         sf.write(saved_path, est_audio, sr)
@@ -88,40 +94,51 @@ def evaluation(model_path, noisy_dir, clean_dir, save_tracks, saved_dir):
     audio_list = os.listdir(noisy_dir)
     audio_list = natsorted(audio_list)
     num = len(audio_list)
-    metrics_total = np.zeros(6)
-    for audio in audio_list:
-        noisy_path = os.path.join(noisy_dir, audio)
-        clean_path = os.path.join(clean_dir, audio)
-        est_audio, length = enhance_one_track(
-            model, noisy_path, saved_dir, 16000 * 16, n_fft, n_fft // 4, save_tracks
+    TEST_DURATIONS = [0.5, 1, 2, 5, 10, 16]  # seconds to test
+
+    for dur in TEST_DURATIONS:
+        metrics_total = np.zeros(6)
+
+
+        for audio in tqdm(audio_list):
+            noisy_path = os.path.join(noisy_dir, audio)
+            clean_path = os.path.join(clean_dir, audio)
+            est_audio, length, runtime = enhance_one_track(
+                model, noisy_path, saved_dir, 16000 * dur, n_fft, n_fft // 4, save_tracks
+            )
+            clean_audio, sr = sf.read(clean_path)
+            clean_audio = torch.FloatTensor(clean_audio)
+            if sr != 16000:
+                resampler = torchaudio.transforms.Resample(orig_freq=sr, new_freq=16000)
+                clean_audio = resampler(clean_audio)
+                sr = 16000
+            clean_audio = clean_audio.cpu().numpy()
+            assert sr == 16000
+            metrics = compute_metrics(clean_audio, est_audio, sr, 0)
+            metrics = np.array(metrics)
+            metrics_total += metrics
+
+        metrics_avg = metrics_total / num
+        print(
+            "Duration: ", dur,
+            "pesq: ",
+            metrics_avg[0],
+            "csig: ",
+            metrics_avg[1],
+            "cbak: ",
+            metrics_avg[2],
+            "covl: ",
+            metrics_avg[3],
+            "ssnr: ",
+            metrics_avg[4],
+            "stoi: ",
+            metrics_avg[5],
         )
-        clean_audio, sr = sf.read(clean_path)
-        assert sr == 16000
-        metrics = compute_metrics(clean_audio, est_audio, sr, 0)
-        metrics = np.array(metrics)
-        metrics_total += metrics
-
-    metrics_avg = metrics_total / num
-    print(
-        "pesq: ",
-        metrics_avg[0],
-        "csig: ",
-        metrics_avg[1],
-        "cbak: ",
-        metrics_avg[2],
-        "covl: ",
-        metrics_avg[3],
-        "ssnr: ",
-        metrics_avg[4],
-        "stoi: ",
-        metrics_avg[5],
-    )
-
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--model_path", type=str, default='./best_ckpt/ckpt_80',
                     help="the path where the model is saved")
-parser.add_argument("--test_dir", type=str, default='/users/PAS3239/hamilton1565/CMGAN-Causal/VCTK-DEMAND',
+parser.add_argument("--test_dir", type=str, default='/users/PAS3239/hamilton1565/CMGAN-Causal/VCTK-DEMAND/test',
                     help="noisy tracks dir to be enhanced")
 parser.add_argument("--save_tracks", type=str, default=True, help="save predicted tracks or not")
 parser.add_argument("--save_dir", type=str, default='./saved_tracks_best', help="where enhanced tracks to be saved")
